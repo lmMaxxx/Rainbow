@@ -24,6 +24,7 @@ import org.geysermc.rainbow.mapping.texture.TextureHolder;
 import org.jetbrains.annotations.NotNull;
 
 import java.io.ByteArrayInputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -189,21 +190,35 @@ public class BedrockPack {
         }
 
         public CompletableFuture<?> saveAndTrack(TextureHolder texture, PackSerializer serializer, Path path) {
-            Optional<byte[]> loadedTexture = texture.load(context.assetResolver(), reporter);
-            loadedTexture.ifPresent(bytes -> trackTexture(texture, bytes));
-            return loadedTexture.map(bytes -> serializer.saveTexture(bytes, path)).orElseGet(() -> CompletableFuture.completedFuture(null));
+            try {
+                Optional<byte[]> loadedTexture = texture.load(context.assetResolver(), reporter);
+                if (loadedTexture.isPresent()) {
+                    byte[] bytes = loadedTexture.get();
+                    trackTexture(texture.location(), () -> NativeImage.read(new ByteArrayInputStream(bytes)));
+                    return serializer.saveTexture(bytes, path);
+                }
+            } catch (UnsupportedOperationException ignored) {
+                // Some textures (e.g. rendered ones) can only be produced through save()
+            }
+
+            return texture.save(context.assetResolver(), serializer, path, reporter)
+                    .whenComplete((ignored, throwable) -> {
+                        if (throwable == null && Files.exists(path)) {
+                            trackTexture(texture.location(), () -> NativeImage.read(Files.newInputStream(path)));
+                        }
+                    });
         }
 
-        private void trackTexture(TextureHolder holder, byte[] texture) {
-            if (!trackedTextures.add(holder.location())) {
+        private void trackTexture(ResourceLocation location, ImageSupplier imageSupplier) {
+            if (!trackedTextures.add(location)) {
                 return;
             }
 
             RainbowIO.safeIO(() -> {
-                try (NativeImage image = NativeImage.read(new ByteArrayInputStream(texture))) {
+                try (NativeImage image = imageSupplier.get()) {
                     updateSize(image.getWidth(), image.getHeight());
                 } catch (Exception exception) {
-                    reporter.report(() -> "failed to read texture size for " + holder.location() + ": " + exception.getMessage());
+                    reporter.report(() -> "failed to read texture size for " + location + ": " + exception.getMessage());
                 }
                 return null;
             });
@@ -212,6 +227,11 @@ public class BedrockPack {
         private void updateSize(int width, int height) {
             textureWidth.getAndUpdate(previous -> Math.max(previous, width));
             textureHeight.getAndUpdate(previous -> Math.max(previous, height));
+        }
+
+        @FunctionalInterface
+        private interface ImageSupplier {
+            NativeImage get() throws Exception;
         }
     }
 
