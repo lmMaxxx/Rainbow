@@ -1,5 +1,6 @@
 package org.geysermc.rainbow.pack;
 
+import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.datafixers.util.Pair;
 import net.minecraft.core.Holder;
 import net.minecraft.core.component.DataComponentPatch;
@@ -22,6 +23,8 @@ import org.geysermc.rainbow.definition.GeyserMappings;
 import org.geysermc.rainbow.mapping.texture.TextureHolder;
 import org.jetbrains.annotations.NotNull;
 
+import java.io.ByteArrayInputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -30,7 +33,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.UnaryOperator;
 
@@ -122,16 +127,19 @@ public class BedrockPack {
 
         futures.add(serializer.saveJson(GeyserMappings.CODEC, context.mappings(), paths.mappings()));
         manifest.ifPresent(manifest -> futures.add(serializer.saveJson(PackManifest.CODEC, manifest, paths.manifest())));
-        futures.add(serializer.saveJson(BedrockTextureAtlas.CODEC, BedrockTextureAtlas.itemAtlas(name, itemTextures), paths.itemAtlas()));
+        TextureSizeTracker textureSizeTracker = new TextureSizeTracker();
 
         Function<TextureHolder, CompletableFuture<?>> textureSaver = texture -> {
             ResourceLocation textureLocation = Rainbow.decorateTextureLocation(texture.location());
-            return texture.save(context.assetResolver(), serializer, paths.packRoot().resolve(textureLocation.getPath()), reporter);
+            return textureSizeTracker.saveAndTrack(texture, serializer, paths.packRoot().resolve(textureLocation.getPath()));
         };
 
         for (BedrockItem item : bedrockItems) {
             futures.add(item.save(serializer, paths.attachables(), paths.geometry(), paths.animation(), textureSaver));
         }
+
+        BedrockTextureAtlas itemAtlas = BedrockTextureAtlas.itemAtlas(name, itemTextures, textureSizeTracker.textureWidth(), textureSizeTracker.textureHeight());
+        futures.add(serializer.saveJson(BedrockTextureAtlas.CODEC, itemAtlas, paths.itemAtlas()));
 
         if (reporter instanceof AutoCloseable closeable) {
             try {
@@ -164,6 +172,67 @@ public class BedrockPack {
 
     public static Builder builder(String name, Path mappingsPath, Path packRootPath, PackSerializer packSerializer, AssetResolver assetResolver) {
         return new Builder(name, mappingsPath, packRootPath, packSerializer, assetResolver);
+    }
+
+    private class TextureSizeTracker {
+        private static final int DEFAULT_TEXTURE_SIZE = 16;
+
+        private final AtomicInteger textureWidth = new AtomicInteger(DEFAULT_TEXTURE_SIZE);
+        private final AtomicInteger textureHeight = new AtomicInteger(DEFAULT_TEXTURE_SIZE);
+        private final Set<ResourceLocation> trackedTextures = ConcurrentHashMap.newKeySet();
+
+        public int textureWidth() {
+            return textureWidth.get();
+        }
+
+        public int textureHeight() {
+            return textureHeight.get();
+        }
+
+        public CompletableFuture<?> saveAndTrack(TextureHolder texture, PackSerializer serializer, Path path) {
+            try {
+                Optional<byte[]> loadedTexture = texture.load(context.assetResolver(), reporter);
+                if (loadedTexture.isPresent()) {
+                    byte[] bytes = loadedTexture.get();
+                    trackTexture(texture.location(), () -> NativeImage.read(new ByteArrayInputStream(bytes)));
+                    return serializer.saveTexture(bytes, path);
+                }
+            } catch (UnsupportedOperationException ignored) {
+                // Some textures (e.g. rendered ones) can only be produced through save()
+            }
+
+            return texture.save(context.assetResolver(), serializer, path, reporter)
+                    .whenComplete((ignored, throwable) -> {
+                        if (throwable == null && Files.exists(path)) {
+                            trackTexture(texture.location(), () -> NativeImage.read(Files.newInputStream(path)));
+                        }
+                    });
+        }
+
+        private void trackTexture(ResourceLocation location, ImageSupplier imageSupplier) {
+            if (!trackedTextures.add(location)) {
+                return;
+            }
+
+            RainbowIO.safeIO(() -> {
+                try (NativeImage image = imageSupplier.get()) {
+                    updateSize(image.getWidth(), image.getHeight());
+                } catch (Exception exception) {
+                    reporter.report(() -> "failed to read texture size for " + location + ": " + exception.getMessage());
+                }
+                return null;
+            });
+        }
+
+        private void updateSize(int width, int height) {
+            textureWidth.getAndUpdate(previous -> Math.max(previous, width));
+            textureHeight.getAndUpdate(previous -> Math.max(previous, height));
+        }
+
+        @FunctionalInterface
+        private interface ImageSupplier {
+            NativeImage get() throws Exception;
+        }
     }
 
     public static class Builder {
